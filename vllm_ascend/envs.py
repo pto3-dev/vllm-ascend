@@ -28,6 +28,29 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # PyPTO-Lib checkout used by the experimental Qwen3-14B Decode bridge.
+    # Defaults to the legacy PYPTO_LIB_ROOT value for compatibility; not sensitive.
+    "VLLM_ASCEND_PYPTO_LIB_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_LIB_ROOT", os.getenv("PYPTO_LIB_ROOT")),
+    # Root directory for Qwen3-14B PyPTO compiled artifacts. Each operator uses
+    # its own child directory. Defaults to a temporary directory; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT"),
+    # Enable expensive CPU references for Qwen3-14B paged-attention diagnosis.
+    # 0 disables the references and 1 enables them; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_PA_DIAGNOSTIC": lambda: bool(int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_PA_DIAGNOSTIC", "0"))),
+    # Opt-in Qwen3-14B PyPTO Decode MLP: off, shadow, or replace.
+    "VLLM_ASCEND_PYPTO_QWEN3_MLP_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_MLP_MODE", "off"),
+    # Opt-in Qwen3-14B Decode input/post RMSNorm: off, shadow, or replace; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_RMS_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_RMS_MODE", "off"),
+    # Opt-in Qwen3-14B PyPTO Decode QKV: off, shadow, or replace; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_QKV_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_QKV_MODE", "off"),
+    # Diagnostic Qwen3-14B PyPTO Decode Q/K norm and RoPE: off or shadow.
+    "VLLM_ASCEND_PYPTO_QWEN3_QK_ROPE_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_QK_ROPE_MODE", "off"),
+    # Opt-in Qwen3-14B PyPTO Decode RoPE: off, shadow, or replace.
+    "VLLM_ASCEND_PYPTO_QWEN3_ROPE_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_ROPE_MODE", "off"),
+    # Opt-in Qwen3-14B PyPTO one-page paged attention: off, shadow, or replace.
+    "VLLM_ASCEND_PYPTO_QWEN3_PA_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_PA_MODE", "off"),
+    # Opt-in fused Qwen3-14B Decode Q/K norm, RoPE, KV append, and PA.
+    "VLLM_ASCEND_PYPTO_QWEN3_FUSED_PA_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_FUSED_PA_MODE", "off"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
