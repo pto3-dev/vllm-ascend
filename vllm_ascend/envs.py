@@ -28,6 +28,57 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # PyPTO-Lib checkout used by the experimental Qwen3-14B Decode bridge.
+    # Defaults to the legacy PYPTO_LIB_ROOT value for compatibility; not sensitive.
+    "VLLM_ASCEND_PYPTO_LIB_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_LIB_ROOT", os.getenv("PYPTO_LIB_ROOT")),
+    # Root directory for Qwen3-14B PyPTO compiled artifacts. Each operator uses
+    # its own child directory. Defaults to a temporary directory; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT"),
+    # Enable verbose Simpler diagnostics for the experimental Qwen3 Decode bridge.
+    # 0 (default) suppresses per-run timing logs; 1 enables them; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_DEBUG", "0"))),
+    # Skip the host-side synchronization after a Qwen3 PyPTO dispatch.
+    # 0 (default) synchronizes; 1 skips it for controlled experiments; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_SKIP_POST_SYNC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_SKIP_POST_SYNC", "0"))
+    ),
+    # Reuse private padded input buffers after a completed Qwen3 PyPTO dispatch.
+    # 0 (default) allocates per call; 1 reuses compatible storage; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS", "0"))
+    ),
+    # Pass the existing device sequence-length tensor to Qwen3 PyPTO attention.
+    # 0 (default) uses the legacy tensor; 1 selects the device view; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS", "0"))
+    ),
+    # Enable expensive CPU references for Qwen3-14B paged-attention diagnosis.
+    # 0 disables the references and 1 enables them; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_PA_DIAGNOSTIC": lambda: bool(int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_PA_DIAGNOSTIC", "0"))),
+    # Opt-in Qwen3-14B PyPTO Decode MLP: off, shadow, or replace.
+    "VLLM_ASCEND_PYPTO_QWEN3_MLP_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_MLP_MODE", "off"),
+    # Fuse post-attention RMSNorm and MLP in one Qwen3 Decode callable.
+    # 0 (default) keeps separate callables; 1 requires both modes=replace; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_FUSED_POST_RMS_MLP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_FUSED_POST_RMS_MLP", "0"))
+    ),
+    # Fuse input RMSNorm and QKV projection in one Qwen3 Decode callable.
+    # 0 (default) keeps separate callables; 1 requires RMSNorm/QKV replace modes; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_FUSED_INPUT_RMS_QKV": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_FUSED_INPUT_RMS_QKV", "0"))
+    ),
+    # Opt-in Qwen3-14B Decode input/post RMSNorm: off, shadow, or replace; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_RMS_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_RMS_MODE", "off"),
+    # Opt-in Qwen3-14B PyPTO Decode QKV: off, shadow, or replace; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_QKV_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_QKV_MODE", "off"),
+    # Diagnostic Qwen3-14B PyPTO Decode Q/K norm and RoPE: off or shadow.
+    "VLLM_ASCEND_PYPTO_QWEN3_QK_ROPE_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_QK_ROPE_MODE", "off"),
+    # Opt-in Qwen3-14B PyPTO Decode RoPE: off, shadow, or replace.
+    "VLLM_ASCEND_PYPTO_QWEN3_ROPE_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_ROPE_MODE", "off"),
+    # Opt-in Qwen3-14B PyPTO one-page paged attention: off, shadow, or replace.
+    "VLLM_ASCEND_PYPTO_QWEN3_PA_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_PA_MODE", "off"),
+    # Opt-in fused Qwen3-14B Decode Q/K norm, RoPE, KV append, and PA.
+    "VLLM_ASCEND_PYPTO_QWEN3_FUSED_PA_MODE": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_FUSED_PA_MODE", "off"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
