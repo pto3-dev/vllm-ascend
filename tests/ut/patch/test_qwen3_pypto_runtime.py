@@ -17,9 +17,32 @@
 
 """The Qwen3 PyPTO executors must share one Simpler runtime per device."""
 
+import logging
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+from vllm_ascend import envs
 from vllm_ascend.pypto import qwen3_runtime
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_pad_qwen3_input_reuses_only_private_storage(monkeypatch, reuse):
+    monkeypatch.setitem(envs.env_variables, "VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS", lambda: reuse)
+    first = qwen3_runtime.pad_qwen3_input(torch.ones(1, 3), None, 4)
+    second = qwen3_runtime.pad_qwen3_input(torch.full((1, 3), 2.0), first, 4)
+    assert (first.data_ptr() == second.data_ptr()) is reuse
+    assert torch.equal(second[0], torch.full((3,), 2.0))
+    assert torch.equal(second[1:], torch.zeros(3, 3))
+
+
+def test_qwen3_callables_share_arena_cache_sizing():
+    config = SimpleNamespace(runtime_env=SimpleNamespace())
+    qwen3_runtime.configure_qwen3_call_config(config)
+    assert config.runtime_env.ring_task_window == 1024
+    assert config.runtime_env.ring_heap == 32 * 1024 * 1024
+    assert config.runtime_env.ring_dep_pool == 32768
 
 
 def test_shared_worker_reuses_runtime_per_device(monkeypatch):
@@ -62,3 +85,32 @@ def test_shared_worker_reuses_runtime_per_device(monkeypatch):
 
     qwen3_runtime._finalize_workers()
     assert all(worker.finalized for worker in instances)
+
+
+@pytest.mark.parametrize("debug, expected_level", [(False, logging.WARNING), (True, logging.DEBUG)])
+def test_simpler_log_level_is_configured_before_worker_init(monkeypatch, debug, expected_level):
+    previous_level = logging.getLogger("simpler").level
+
+    class FakeWorker:
+        def init(self, *, device_id, bins):
+            assert logging.getLogger("simpler").level == expected_level
+
+        def finalize(self):
+            pass
+
+    class FakeBuilder:
+        def __init__(self, *, platform):
+            pass
+
+        def get_binaries(self, runtime, *, build):
+            return SimpleNamespace()
+
+    monkeypatch.setattr(qwen3_runtime, "ChipWorker", FakeWorker)
+    monkeypatch.setattr(qwen3_runtime, "RuntimeBuilder", FakeBuilder)
+    monkeypatch.setattr(qwen3_runtime, "_workers", {})
+    monkeypatch.setitem(envs.env_variables, "VLLM_ASCEND_PYPTO_QWEN3_DEBUG", lambda: debug)
+    try:
+        qwen3_runtime.get_shared_worker(5)
+        qwen3_runtime._finalize_workers()
+    finally:
+        logging.getLogger("simpler").setLevel(previous_level)

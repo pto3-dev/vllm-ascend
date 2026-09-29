@@ -25,6 +25,8 @@ from pathlib import Path
 
 import torch
 
+from vllm_ascend import envs
+
 _BATCH_MAX = 16
 _NUM_Q_HEADS = 40
 _NUM_KV_HEADS = 8
@@ -48,7 +50,7 @@ class Qwen3FusedAttentionExecutor:
         from pypto.runtime import ExecutionMode, RunConfig
         from simpler.task_interface import CallConfig
 
-        from vllm_ascend.pypto.qwen3_runtime import get_shared_worker
+        from vllm_ascend.pypto.qwen3_runtime import configure_qwen3_call_config, get_shared_worker
 
         kernel = importlib.import_module("paged_attention_vllm").qwen3_vllm_fused_attention
         compiled = kernel.compile(
@@ -63,9 +65,7 @@ class Qwen3FusedAttentionExecutor:
         self._worker, self._lock = get_shared_worker(device_id)
         self._handle = self._worker.register_callable(compiled.chip_callable)
         self._call_config = CallConfig()
-        self._call_config.runtime_env.ring_task_window = 1024
-        self._call_config.runtime_env.ring_heap = 32 * 1024 * 1024
-        self._call_config.runtime_env.ring_dep_pool = 32768
+        configure_qwen3_call_config(self._call_config)
         self._device_id = device_id
         self._closed = False
         atexit.register(self.close)
@@ -174,7 +174,8 @@ class Qwen3FusedAttentionExecutor:
             ):
                 args.add_tensor(self._chip_tensor(tensor))
             self._worker.run(self._handle, args, self._call_config)
-            torch.npu.synchronize(self._device_id)
+            if not envs.VLLM_ASCEND_PYPTO_QWEN3_SKIP_POST_SYNC:
+                torch.npu.synchronize(self._device_id)
             return output.view(batch, _NUM_Q_HEADS, _HEAD_DIM)
 
     def close(self) -> None:

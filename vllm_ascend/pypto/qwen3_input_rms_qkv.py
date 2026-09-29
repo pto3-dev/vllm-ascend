@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""PyPTO-backed Qwen3-14B Decode RMSNorm and fused-add RMSNorm."""
+"""One-call Qwen3-14B Decode input RMSNorm and QKV executor."""
 
 from __future__ import annotations
 
@@ -26,19 +26,18 @@ from pathlib import Path
 
 import torch
 
-from vllm_ascend import envs
-
 _BATCH_PAD = 16
 _HIDDEN = 5120
+_QKV_SIZE = 7168
 
 
-class Qwen3RMSNormExecutor:
-    """Compile both RMSNorm forms and reuse their callables across layers."""
+class Qwen3InputRMSQKVExecutor:
+    """Run plain or residual-add input norm and QKV in one callable."""
 
     def __init__(self, pypto_lib_root: str, build_dir: str, device_id: int) -> None:
         model_dir = Path(pypto_lib_root).resolve() / "models" / "qwen3_14b"
-        if not (model_dir / "rmsnorm_vllm.py").is_file():
-            raise FileNotFoundError(model_dir / "rmsnorm_vllm.py")
+        if not (model_dir / "input_rms_qkv_vllm.py").is_file():
+            raise FileNotFoundError(model_dir / "input_rms_qkv_vllm.py")
         if str(model_dir) not in sys.path:
             sys.path.insert(0, str(model_dir))
 
@@ -47,7 +46,7 @@ class Qwen3RMSNormExecutor:
 
         from vllm_ascend.pypto.qwen3_runtime import configure_qwen3_call_config, get_shared_worker
 
-        module = importlib.import_module("rmsnorm_vllm")
+        module = importlib.import_module("input_rms_qkv_vllm")
 
         def compile_kernel(kernel, name: str):
             return kernel.compile(
@@ -60,16 +59,14 @@ class Qwen3RMSNormExecutor:
                 )
             )
 
-        plain = compile_kernel(module.qwen3_rmsnorm_decode, "plain")
-        fused = compile_kernel(module.qwen3_add_rmsnorm_decode, "fused")
+        plain = compile_kernel(module.qwen3_input_rms_qkv_decode, "plain")
+        fused = compile_kernel(module.qwen3_add_input_rms_qkv_decode, "fused")
         self._worker, self._lock = get_shared_worker(device_id)
         self._plain_handle = self._worker.register_callable(plain.chip_callable)
         self._fused_handle = self._worker.register_callable(fused.chip_callable)
         self._call_config = CallConfig()
         configure_qwen3_call_config(self._call_config)
         self._device_id = device_id
-        self._cached_input: torch.Tensor | None = None
-        self._cached_residual: torch.Tensor | None = None
         self._closed = False
         atexit.register(self.close)
 
@@ -81,59 +78,54 @@ class Qwen3RMSNormExecutor:
     def _chip_tensor(tensor: torch.Tensor):
         from simpler.task_interface import ChipTensor, DataType
 
-        return ChipTensor.make(
-            tensor.data_ptr(),
-            tuple(tensor.shape),
-            DataType.BFLOAT16,
-            child_memory=True,
-        )
+        return ChipTensor.make(tensor.data_ptr(), tuple(tensor.shape), DataType.BFLOAT16, child_memory=True)
 
     def run(
         self,
         x: torch.Tensor,
-        weight: torch.Tensor,
-        residual: torch.Tensor | None = None,
+        residual: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        qkv_weight: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from simpler.task_interface import ChipStorageTaskArgs
 
         if x.ndim != 2 or x.shape[1] != _HIDDEN or not (1 <= x.shape[0] <= _BATCH_PAD):
-            raise ValueError(f"Unsupported Qwen3 RMSNorm input shape: {tuple(x.shape)}")
-        if tuple(weight.shape) != (_HIDDEN,):
-            raise ValueError(f"Unexpected RMSNorm weight shape: {tuple(weight.shape)}")
-        tensors = (x, weight) if residual is None else (x, weight, residual)
+            raise ValueError(f"Unsupported Qwen3 input-RMS+QKV shape: {tuple(x.shape)}")
+        if residual is not None and residual.shape != x.shape:
+            raise ValueError("Input RMSNorm residual must match hidden states")
+        if tuple(norm_weight.shape) != (_HIDDEN,):
+            raise ValueError(f"Unexpected input RMSNorm weight shape: {tuple(norm_weight.shape)}")
+        if tuple(qkv_weight.shape) != (_QKV_SIZE, _HIDDEN):
+            raise ValueError(f"Unexpected QKV weight shape: {tuple(qkv_weight.shape)}")
+        tensors = (x, norm_weight, qkv_weight) if residual is None else (x, residual, norm_weight, qkv_weight)
         for tensor in tensors:
             if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
-                raise ValueError("Qwen3 PyPTO RMSNorm requires contiguous BF16 tensors")
+                raise ValueError("Qwen3 PyPTO input-RMS+QKV requires contiguous BF16 tensors")
             if tensor.device.type != "npu" or tensor.device.index != self._device_id:
-                raise ValueError("Qwen3 PyPTO RMSNorm tensors must reside on the selected NPU")
-        if residual is not None and residual.shape != x.shape:
-            raise ValueError("RMSNorm residual must match the hidden-state shape")
+                raise ValueError("Qwen3 PyPTO input-RMS+QKV tensors must reside on the selected NPU")
 
         with self._lock:
-            from vllm_ascend.pypto.qwen3_runtime import pad_qwen3_input
-
             batch = x.shape[0]
-            padded_x = pad_qwen3_input(x, self._cached_input, _BATCH_PAD)
-            if envs.VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS:
-                self._cached_input = padded_x
-            output = torch.empty_like(padded_x)
-            weight_view = weight.reshape(1, _HIDDEN)
+            padded_x = torch.zeros((_BATCH_PAD, _HIDDEN), dtype=x.dtype, device=x.device)
+            padded_x[:batch].copy_(x)
+            qkv_out = torch.empty((_BATCH_PAD, _QKV_SIZE), dtype=x.dtype, device=x.device)
+            norm_weight_view = norm_weight.reshape(1, _HIDDEN)
             args = ChipStorageTaskArgs()
             if residual is None:
-                for tensor in (padded_x, weight_view, output):
+                for tensor in (padded_x, norm_weight_view, qkv_weight, qkv_out):
                     args.add_tensor(self._chip_tensor(tensor))
                 handle = self._plain_handle
                 residual_output = x
             else:
-                padded_residual = pad_qwen3_input(residual, self._cached_residual, _BATCH_PAD)
-                if envs.VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS:
-                    self._cached_residual = padded_residual
+                padded_residual = torch.zeros_like(padded_x)
+                padded_residual[:batch].copy_(residual)
                 padded_residual_output = torch.empty_like(padded_x)
                 for tensor in (
                     padded_x,
                     padded_residual,
-                    weight_view,
-                    output,
+                    norm_weight_view,
+                    qkv_weight,
+                    qkv_out,
                     padded_residual_output,
                 ):
                     args.add_tensor(self._chip_tensor(tensor))
@@ -141,9 +133,8 @@ class Qwen3RMSNormExecutor:
                 residual_output = padded_residual_output[:batch]
             torch.npu.synchronize(self._device_id)
             self._worker.run(handle, args, self._call_config)
-            if not envs.VLLM_ASCEND_PYPTO_QWEN3_SKIP_POST_SYNC:
-                torch.npu.synchronize(self._device_id)
-            return output[:batch], residual_output
+            torch.npu.synchronize(self._device_id)
+            return qkv_out[:batch], residual_output
 
     def close(self) -> None:
         if self._closed:

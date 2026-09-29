@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
@@ -170,6 +171,8 @@ class AscendMetadata:
     # is unified.
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
+    # Optional PyPTO Decode view of the already-existing device sequence lengths.
+    pypto_seq_lens_device: torch.Tensor | None = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
@@ -310,6 +313,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
+            pypto_seq_lens_device=(
+                common_attn_metadata.seq_lens[:num_reqs]
+                if envs_ascend.VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS and attn_state == AscendAttentionState.DecodeOnly
+                else None
+            ),
             seq_lens_list=seq_lens.tolist(),
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=query_start_loc_cpu[1:].tolist(),

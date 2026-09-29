@@ -20,17 +20,41 @@
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import tempfile
 import threading
 
-from simpler.task_interface import ChipWorker
+import torch
+from simpler.task_interface import CallConfig, ChipWorker
 from simpler_setup.runtime_builder import RuntimeBuilder
 
 from vllm_ascend import envs
 
 _workers: dict[int, tuple[ChipWorker, threading.Lock]] = {}
 _registry_lock = threading.Lock()
+
+
+def configure_qwen3_call_config(config: CallConfig) -> None:
+    """Keep Simpler's single prebuilt-arena cache key stable across callables."""
+    config.runtime_env.ring_task_window = 1024
+    config.runtime_env.ring_heap = 32 * 1024 * 1024
+    config.runtime_env.ring_dep_pool = 32768
+
+
+def pad_qwen3_input(source: torch.Tensor, cached: torch.Tensor | None, batch_pad: int) -> torch.Tensor:
+    """Zero-pad an input, optionally reusing private storage after a completed run."""
+    shape = (batch_pad, *source.shape[1:])
+    if envs.VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS:
+        if cached is None:
+            cached = torch.empty(shape, dtype=source.dtype, device=source.device)
+        elif cached.shape != shape or cached.dtype != source.dtype or cached.device != source.device:
+            raise ValueError("Cached Qwen3 input has an incompatible shape or device")
+        cached.zero_()
+    else:
+        cached = torch.zeros(shape, dtype=source.dtype, device=source.device)
+    cached[: source.shape[0]].copy_(source)
+    return cached
 
 
 def get_pypto_paths(component: str) -> tuple[str, str]:
@@ -50,6 +74,8 @@ def get_shared_worker(device_id: int) -> tuple[ChipWorker, threading.Lock]:
         existing = _workers.get(device_id)
         if existing is not None:
             return existing
+        # Worker.init snapshots the Simpler threshold, so configure it first.
+        logging.getLogger("simpler").setLevel(logging.DEBUG if envs.VLLM_ASCEND_PYPTO_QWEN3_DEBUG else logging.WARNING)
         worker = ChipWorker()
         binaries = RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=False)
         worker.init(device_id=device_id, bins=binaries)

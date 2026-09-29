@@ -23,6 +23,7 @@ import pytest
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.patch.worker import patch_qwen3_pypto_mlp as patch
+from vllm_ascend.patch.worker import patch_qwen3_pypto_qkv as qkv_patch
 
 
 @pytest.mark.parametrize(
@@ -91,4 +92,87 @@ def test_decode_routes_both_rmsnorms_to_pypto(monkeypatch):
         ("attention", {"positions": 7, "hidden_states": normed_input}),
         ("post_attention", post_norm, attention_output, residual),
         ("mlp", normed_post),
+    ]
+
+
+def test_decode_routes_post_rms_and_mlp_to_one_callable(monkeypatch):
+    calls = []
+    residual = object()
+    normed_input = object()
+    attention_output = SimpleNamespace(device=SimpleNamespace(index=4))
+    mlp_output = object()
+    next_residual = object()
+    norm_weight = object()
+    gate_up_weight = object()
+    down_weight = object()
+
+    class FusedExecutor:
+        def run(self, *args):
+            calls.append(("fused", args))
+            return mlp_output, next_residual
+
+    layer = SimpleNamespace(
+        input_layernorm=object(),
+        post_attention_layernorm=SimpleNamespace(weight=norm_weight),
+        self_attn=lambda **kwargs: attention_output,
+        mlp=SimpleNamespace(
+            gate_up_proj=SimpleNamespace(weight=gate_up_weight),
+            down_proj=SimpleNamespace(weight=down_weight),
+        ),
+    )
+    monkeypatch.setattr(patch, "_pure_decode", lambda: True)
+    monkeypatch.setattr(patch, "_RMS_MODE", "replace")
+    monkeypatch.setattr(patch, "_MODE", "replace")
+    monkeypatch.setattr(patch, "_FUSED_POST_RMS_MLP", True)
+    monkeypatch.setattr(patch, "rms_forward", lambda *args: (normed_input, residual))
+    monkeypatch.setattr(patch, "_get_fused_executor", lambda device_id: FusedExecutor())
+
+    result = patch._qwen3_decode_forward(layer, 7, object(), None)
+    assert result == (mlp_output, next_residual)
+    assert calls == [("fused", (attention_output, residual, norm_weight, gate_up_weight, down_weight))]
+
+
+def test_decode_routes_input_rms_and_qkv_to_one_callable(monkeypatch):
+    calls = []
+    hidden = SimpleNamespace(device=SimpleNamespace(index=4))
+    qkv = object()
+    residual = object()
+    attention_output = object()
+    normed_post = object()
+    mlp_output = object()
+    input_weight = object()
+    qkv_weight = object()
+
+    class InputExecutor:
+        def run(self, *args):
+            calls.append(("input_fused", args))
+            return qkv, residual
+
+    attention = SimpleNamespace(qkv_proj=SimpleNamespace(weight=qkv_weight, bias=None))
+    layer = SimpleNamespace(
+        input_layernorm=SimpleNamespace(weight=input_weight),
+        post_attention_layernorm=object(),
+        self_attn=attention,
+        mlp=lambda value: mlp_output,
+    )
+    monkeypatch.setattr(patch, "_pure_decode", lambda: True)
+    monkeypatch.setattr(patch, "_RMS_MODE", "replace")
+    monkeypatch.setattr(patch, "_MODE", "off")
+    monkeypatch.setattr(patch, "_FUSED_INPUT_RMS_QKV", True)
+    monkeypatch.setattr(patch, "_FUSED_POST_RMS_MLP", False)
+    monkeypatch.setattr(patch, "_get_fused_input_executor", lambda device_id: InputExecutor())
+    monkeypatch.setattr(
+        qkv_patch,
+        "run_qwen3_attention_from_qkv",
+        lambda self_attn, positions, projected: (
+            calls.append(("attention", self_attn, positions, projected)) or attention_output
+        ),
+    )
+    monkeypatch.setattr(patch, "rms_forward", lambda *args: (normed_post, residual))
+
+    result = patch._qwen3_decode_forward(layer, 7, hidden, None)
+    assert result == (mlp_output, residual)
+    assert calls == [
+        ("input_fused", (hidden, None, input_weight, qkv_weight)),
+        ("attention", attention, 7, qkv),
     ]

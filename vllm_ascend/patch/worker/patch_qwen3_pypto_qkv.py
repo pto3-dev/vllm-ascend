@@ -232,6 +232,15 @@ def _run_rope_path(
     return native_q, native_k
 
 
+def _fused_pa_seq_lens(metadata) -> torch.Tensor:
+    if not envs.VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS:
+        return metadata.seq_lens
+    device_seq_lens = metadata.pypto_seq_lens_device
+    if device_seq_lens is None:
+        raise RuntimeError("PyPTO Qwen3 Decode requires device sequence lengths")
+    return device_seq_lens
+
+
 def _run_fused_pa(self: Qwen3Attention, qkv: torch.Tensor) -> torch.Tensor:
     forward_context = get_forward_context()
     if isinstance(forward_context.attn_metadata, list):
@@ -247,7 +256,8 @@ def _run_fused_pa(self: Qwen3Attention, qkv: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("PyPTO Qwen3 fused attention requires initialized pure-Decode paged KV cache")
 
     batch = qkv.shape[0]
-    if metadata.seq_lens.numel() < batch or metadata.slot_mapping.numel() < batch:
+    seq_lens = _fused_pa_seq_lens(metadata)
+    if seq_lens.numel() < batch or metadata.slot_mapping.numel() < batch:
         raise RuntimeError("PyPTO Qwen3 fused attention received incomplete Decode metadata")
     if not getattr(self.rotary_emb, "is_neox_style", False) or getattr(self.rotary_emb, "rotary_dim", None) != 128:
         raise RuntimeError("PyPTO Qwen3 fused attention requires 128-dim NeoX RoPE")
@@ -260,13 +270,52 @@ def _run_fused_pa(self: Qwen3Attention, qkv: torch.Tensor) -> torch.Tensor:
         backend.key_cache,
         backend.value_cache,
         metadata.block_tables,
-        metadata.seq_lens,
+        seq_lens,
         metadata.slot_mapping,
         rope_cos.float().contiguous(),
         rope_sin.float().contiguous(),
         self.q_norm.weight.float().view(1, 128).contiguous(),
         self.k_norm.weight.float().view(1, 128).contiguous(),
     )
+
+
+def run_qwen3_attention_from_qkv(
+    self: Qwen3Attention,
+    positions: torch.Tensor,
+    qkv: torch.Tensor,
+) -> torch.Tensor:
+    if _FUSED_PA_MODE == "off":
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = _run_rope_path(self, positions, q, k)
+        attn_output = self.attn(q, k, v)
+    else:
+        pypto_attn = _run_fused_pa(self, qkv).view(qkv.shape[0], self.q_size)
+        global _FUSED_PA_DISPATCH_COUNT, _FUSED_PA_MAX_ABS
+        _FUSED_PA_DISPATCH_COUNT += 1
+        if _FUSED_PA_MODE == "shadow":
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = _run_rope_path(self, positions, q, k)
+            native_attn = self.attn(q, k, v)
+            delta = pypto_attn.float() - native_attn.float()
+            _FUSED_PA_MAX_ABS = max(_FUSED_PA_MAX_ABS, delta.abs().max().item())
+            if _FUSED_PA_DISPATCH_COUNT % 40 == 0:
+                _LOG.warning(
+                    "PyPTO Qwen3 fused PA dispatched=%d max_abs=%.6g rmse=%.6g ref_rms=%.6g",
+                    _FUSED_PA_DISPATCH_COUNT,
+                    _FUSED_PA_MAX_ABS,
+                    delta.square().mean().sqrt().item(),
+                    native_attn.float().square().mean().sqrt().item(),
+                )
+            attn_output = native_attn
+        else:
+            if _FUSED_PA_DISPATCH_COUNT % 40 == 0:
+                _LOG.warning(
+                    "PyPTO Qwen3 fused PA replaced %d layers",
+                    _FUSED_PA_DISPATCH_COUNT,
+                )
+            attn_output = pypto_attn
+    output, _ = self.o_proj(attn_output)
+    return output
 
 
 def _qwen3_attention_forward(
@@ -318,38 +367,7 @@ def _qwen3_attention_forward(
         else:
             qkv = pypto_qkv
 
-    if _FUSED_PA_MODE == "off":
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = _run_rope_path(self, positions, q, k)
-        attn_output = self.attn(q, k, v)
-    else:
-        pypto_attn = _run_fused_pa(self, qkv).view(qkv.shape[0], self.q_size)
-        global _FUSED_PA_DISPATCH_COUNT, _FUSED_PA_MAX_ABS
-        _FUSED_PA_DISPATCH_COUNT += 1
-        if _FUSED_PA_MODE == "shadow":
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = _run_rope_path(self, positions, q, k)
-            native_attn = self.attn(q, k, v)
-            delta = pypto_attn.float() - native_attn.float()
-            _FUSED_PA_MAX_ABS = max(_FUSED_PA_MAX_ABS, delta.abs().max().item())
-            if _FUSED_PA_DISPATCH_COUNT % 40 == 0:
-                _LOG.warning(
-                    "PyPTO Qwen3 fused PA dispatched=%d max_abs=%.6g rmse=%.6g ref_rms=%.6g",
-                    _FUSED_PA_DISPATCH_COUNT,
-                    _FUSED_PA_MAX_ABS,
-                    delta.square().mean().sqrt().item(),
-                    native_attn.float().square().mean().sqrt().item(),
-                )
-            attn_output = native_attn
-        else:
-            if _FUSED_PA_DISPATCH_COUNT % 40 == 0:
-                _LOG.warning(
-                    "PyPTO Qwen3 fused PA replaced %d layers",
-                    _FUSED_PA_DISPATCH_COUNT,
-                )
-            attn_output = pypto_attn
-    output, _ = self.o_proj(attn_output)
-    return output
+    return run_qwen3_attention_from_qkv(self, positions, qkv)
 
 
 if _MODE != "off" or _QK_ROPE_MODE != "off" or _ROPE_MODE != "off" or _FUSED_PA_MODE != "off":

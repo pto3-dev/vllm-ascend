@@ -48,7 +48,7 @@ class Qwen3PagedAttentionExecutor:
         from pypto.runtime import ExecutionMode, RunConfig
         from simpler.task_interface import CallConfig
 
-        from vllm_ascend.pypto.qwen3_runtime import get_shared_worker
+        from vllm_ascend.pypto.qwen3_runtime import configure_qwen3_call_config, get_shared_worker
 
         kernel = importlib.import_module("paged_attention_vllm").qwen3_paged_attention_one_page_direct
         compiled = kernel.compile(
@@ -63,9 +63,7 @@ class Qwen3PagedAttentionExecutor:
         self._worker, self._lock = get_shared_worker(device_id)
         self._handle = self._worker.register_callable(compiled.chip_callable)
         self._call_config = CallConfig()
-        self._call_config.runtime_env.ring_task_window = 1024
-        self._call_config.runtime_env.ring_heap = 16 * 1024 * 1024
-        self._call_config.runtime_env.ring_dep_pool = 32768
+        configure_qwen3_call_config(self._call_config)
         self._device_id = device_id
         self._closed = False
         atexit.register(self.close)

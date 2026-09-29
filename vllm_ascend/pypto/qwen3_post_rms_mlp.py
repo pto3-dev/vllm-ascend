@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""PyPTO-backed Qwen3-14B packed QKV projection for pure Decode."""
+"""One-call Qwen3-14B Decode post-attention RMSNorm and MLP executor."""
 
 from __future__ import annotations
 
@@ -30,16 +30,16 @@ from vllm_ascend import envs
 
 _BATCH_PAD = 16
 _HIDDEN = 5120
-_QKV_SIZE = 7168
+_INTERMEDIATE = 17408
 
 
-class Qwen3QKVExecutor:
-    """Run a compiled packed QKV projection on the selected Ascend NPU."""
+class Qwen3PostRMSMLPExecutor:
+    """Run the fused post-attention norm and MLP callable for any decoder layer."""
 
     def __init__(self, pypto_lib_root: str, build_dir: str, device_id: int) -> None:
         model_dir = Path(pypto_lib_root).resolve() / "models" / "qwen3_14b"
-        if not (model_dir / "qkv_vllm.py").is_file():
-            raise FileNotFoundError(model_dir / "qkv_vllm.py")
+        if not (model_dir / "post_rms_mlp_vllm.py").is_file():
+            raise FileNotFoundError(model_dir / "post_rms_mlp_vllm.py")
         if str(model_dir) not in sys.path:
             sys.path.insert(0, str(model_dir))
 
@@ -48,7 +48,7 @@ class Qwen3QKVExecutor:
 
         from vllm_ascend.pypto.qwen3_runtime import configure_qwen3_call_config, get_shared_worker
 
-        kernel = importlib.import_module("qkv_vllm").qwen3_qkv_decode
+        kernel = importlib.import_module("post_rms_mlp_vllm").qwen3_post_rms_mlp_decode
         compiled = kernel.compile(
             config=RunConfig(
                 execution_mode=ExecutionMode.ONBOARD,
@@ -64,6 +64,7 @@ class Qwen3QKVExecutor:
         configure_qwen3_call_config(self._call_config)
         self._device_id = device_id
         self._cached_input: torch.Tensor | None = None
+        self._cached_residual: torch.Tensor | None = None
         self._closed = False
         atexit.register(self.close)
 
@@ -75,43 +76,62 @@ class Qwen3QKVExecutor:
     def _chip_tensor(tensor: torch.Tensor):
         from simpler.task_interface import ChipTensor, DataType
 
-        return ChipTensor.make(
-            tensor.data_ptr(),
-            tuple(tensor.shape),
-            DataType.BFLOAT16,
-            child_memory=True,
-        )
+        return ChipTensor.make(tensor.data_ptr(), tuple(tensor.shape), DataType.BFLOAT16, child_memory=True)
 
-    def run(self, x: torch.Tensor, qkv_weight: torch.Tensor) -> torch.Tensor:
+    def run(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         from simpler.task_interface import ChipStorageTaskArgs
 
         if x.ndim != 2 or x.shape[1] != _HIDDEN or not (1 <= x.shape[0] <= _BATCH_PAD):
-            raise ValueError(f"Unsupported Qwen3 QKV input shape: {tuple(x.shape)}")
-        if tuple(qkv_weight.shape) != (_QKV_SIZE, _HIDDEN):
-            raise ValueError(f"Unexpected QKV weight shape: {tuple(qkv_weight.shape)}")
-        for tensor in (x, qkv_weight):
+            raise ValueError(f"Unsupported Qwen3 post-RMS+MLP input shape: {tuple(x.shape)}")
+        if residual.shape != x.shape:
+            raise ValueError("Post-attention residual must match hidden states")
+        if tuple(norm_weight.shape) != (_HIDDEN,):
+            raise ValueError(f"Unexpected post-attention RMSNorm weight shape: {tuple(norm_weight.shape)}")
+        if tuple(gate_up_weight.shape) != (2 * _INTERMEDIATE, _HIDDEN):
+            raise ValueError(f"Unexpected gate/up weight shape: {tuple(gate_up_weight.shape)}")
+        if tuple(down_weight.shape) != (_HIDDEN, _INTERMEDIATE):
+            raise ValueError(f"Unexpected down weight shape: {tuple(down_weight.shape)}")
+        for tensor in (x, residual, norm_weight, gate_up_weight, down_weight):
             if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
-                raise ValueError("Qwen3 PyPTO QKV requires contiguous BF16 tensors")
+                raise ValueError("Qwen3 PyPTO post-RMS+MLP requires contiguous BF16 tensors")
             if tensor.device.type != "npu" or tensor.device.index != self._device_id:
-                raise ValueError("Qwen3 PyPTO QKV tensors must reside on the selected NPU")
+                raise ValueError("Qwen3 PyPTO post-RMS+MLP tensors must reside on the selected NPU")
 
         with self._lock:
             from vllm_ascend.pypto.qwen3_runtime import pad_qwen3_input
 
             batch = x.shape[0]
-            padded = pad_qwen3_input(x, self._cached_input, _BATCH_PAD)
+            padded_x = pad_qwen3_input(x, self._cached_input, _BATCH_PAD)
+            padded_residual = pad_qwen3_input(residual, self._cached_residual, _BATCH_PAD)
             if envs.VLLM_ASCEND_PYPTO_QWEN3_REUSE_INPUT_BUFFERS:
-                self._cached_input = padded
-            output = torch.empty((_BATCH_PAD, _QKV_SIZE), dtype=torch.bfloat16, device=x.device)
-            torch.npu.synchronize(self._device_id)
-
+                self._cached_input = padded_x
+                self._cached_residual = padded_residual
+            output = torch.empty_like(padded_x)
+            residual_output = torch.empty_like(padded_x)
+            norm_weight_view = norm_weight.reshape(1, _HIDDEN)
             args = ChipStorageTaskArgs()
-            for tensor in (padded, qkv_weight, output):
+            for tensor in (
+                padded_x,
+                padded_residual,
+                norm_weight_view,
+                gate_up_weight,
+                down_weight,
+                output,
+                residual_output,
+            ):
                 args.add_tensor(self._chip_tensor(tensor))
+            torch.npu.synchronize(self._device_id)
             self._worker.run(self._handle, args, self._call_config)
             if not envs.VLLM_ASCEND_PYPTO_QWEN3_SKIP_POST_SYNC:
                 torch.npu.synchronize(self._device_id)
-            return output[:batch]
+            return output[:batch], residual_output[:batch]
 
     def close(self) -> None:
         if self._closed:

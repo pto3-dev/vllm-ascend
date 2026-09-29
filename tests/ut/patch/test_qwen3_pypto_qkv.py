@@ -25,6 +25,16 @@ import torch
 from vllm_ascend.patch.worker import patch_qwen3_pypto_qkv as patch
 
 
+def test_fused_pa_prefers_device_seq_lens_only_when_enabled(monkeypatch):
+    host = torch.tensor([129], dtype=torch.int32)
+    device = torch.tensor([129], dtype=torch.int32)
+    metadata = SimpleNamespace(seq_lens=host, pypto_seq_lens_device=device)
+    monkeypatch.setitem(patch.envs.env_variables, "VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS", lambda: False)
+    assert patch._fused_pa_seq_lens(metadata) is host
+    monkeypatch.setitem(patch.envs.env_variables, "VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS", lambda: True)
+    assert patch._fused_pa_seq_lens(metadata) is device
+
+
 def test_prefill_uses_original_attention(monkeypatch):
     sentinel = object()
     calls = []
