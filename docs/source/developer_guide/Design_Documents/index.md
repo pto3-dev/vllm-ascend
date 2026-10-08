@@ -18,4 +18,5 @@ quantization
 npugraph_ex
 pypto_qwen3_14b_decode_mlp
 pypto_qwen3_14b_decode_qkv_mlp
+../pypto_qwen3_original_graph
 :::

@@ -85,20 +85,21 @@ def main() -> None:
     parser.add_argument("--url", default="http://127.0.0.1:18084/v1/completions")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output-tokens", type=int, default=128)
+    parser.add_argument("--input-lengths", type=int, nargs="+", default=[300, 600, 1000, 2000])
     args = parser.parse_args()
-    if args.output_tokens < 2:
-        parser.error("--output-tokens must be at least 2 to calculate TPOT")
+    if args.repeats < 1 or args.output_tokens < 2 or any(length < 1 for length in args.input_lengths):
+        parser.error("repeats and input lengths must be positive; output-tokens must be at least 2")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     passage = "Huawei develops AI systems and software. The model answers questions accurately. " * 200
     token_ids = tokenizer.encode(passage, add_special_tokens=False)
-    lengths = (300, 600, 1000, 2000)
+    lengths = tuple(dict.fromkeys(args.input_lengths))
     if len(token_ids) < max(lengths):
-        raise RuntimeError("Prompt source is shorter than 2000 tokens")
+        raise RuntimeError(f"Prompt source is shorter than the requested {max(lengths)} tokens")
     prompts = {length: token_ids[:length] for length in lengths}
 
-    request_once(args.url, args.served_model, prompts[300], 8, stage=args.stage, repeat=-1)
-    request_once(args.url, args.served_model, prompts[2000], 4, stage=args.stage, repeat=-2)
+    request_once(args.url, args.served_model, prompts[lengths[0]], 8, stage=args.stage, repeat=-1)
+    request_once(args.url, args.served_model, prompts[lengths[-1]], 4, stage=args.stage, repeat=-2)
     records = []
     for length in lengths:
         for repeat in range(args.repeats):

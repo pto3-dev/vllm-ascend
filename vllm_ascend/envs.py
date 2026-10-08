@@ -34,6 +34,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Root directory for Qwen3-14B PyPTO compiled artifacts. Each operator uses
     # its own child directory. Defaults to a temporary directory; not sensitive.
     "VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT"),
+    # Experimental original 40-layer callable inside FULL_DECODE_ONLY graphs.
+    # Default off. Requires TP=PP=1, BF16, capture sizes [1]; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH", "0"))
+    ),
     # Enable verbose Simpler diagnostics for the experimental Qwen3 Decode bridge.
     # 0 (default) suppresses per-run timing logs; 1 enables them; not sensitive.
     "VLLM_ASCEND_PYPTO_QWEN3_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_DEBUG", "0"))),

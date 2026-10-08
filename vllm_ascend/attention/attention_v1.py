@@ -315,7 +315,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens_cpu=seq_lens,
             pypto_seq_lens_device=(
                 common_attn_metadata.seq_lens[:num_reqs]
-                if envs_ascend.VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS and attn_state == AscendAttentionState.DecodeOnly
+                if (
+                    envs_ascend.VLLM_ASCEND_PYPTO_QWEN3_DEVICE_SEQ_LENS
+                    or envs_ascend.VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH
+                )
+                and attn_state == AscendAttentionState.DecodeOnly
                 else None
             ),
             seq_lens_list=seq_lens.tolist(),
