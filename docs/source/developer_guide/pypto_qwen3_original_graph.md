@@ -32,12 +32,14 @@ replaced; this is not a graph of the entire serving engine.
 - `pypto/qwen3_graph.py` validates the model, compiles the original body with
   metadata-only examples, packs transposed per-layer weights, and owns fixed
   argument buffers and a dedicated Simpler `ChipWorker`.
+- `pypto/qwen3_graph_config.py` resolves the library and graph artifact paths;
+  it has no shared per-operator worker registry.
 - `attention/attention_v1.py` provides the existing device-side
   `pypto_seq_lens_device` field when this mode is enabled. Captured copies read
   the runner's persistent metadata buffers at replay; CPU sequence lengths
   must not be frozen into the graph.
-- `envs.py` and `patch/worker/__init__.py` add the default-off opt-in and reject
-  simultaneous use of older per-layer replacement modes.
+- `envs.py` and `patch/worker/__init__.py` retain one default-off graph opt-in.
+  Older per-operator adapters, shadow/replace modes, and their flags are removed.
 - PyPTO's Simpler submodule adds `prepare_graph_run`, `enqueue_graph_run`, and
   `finalize_graph_run` across Python, bindings, ChipWorker, common C API, and
   the a2a3 device runner. Graph execution still uses Simpler's device scheduler.
@@ -53,8 +55,9 @@ Captured D2D copies synchronize the stacked KV pool with vLLM's native pools.
 
 The original Decode kernel uses FP32 inter-layer carry; native vLLM has BF16
 rounding boundaries. Graph-versus-eager equality for this callable does not
-prove native-vLLM precision parity. Do not replace the established precision
-validated per-layer path or publish a speedup without separate validation.
+prove native-vLLM precision parity. Do not publish a speedup or numerical
+equality claim without separate validation. The earlier per-layer integration
+is no longer an active alternative in this checkout.
 
 Initial limits: Qwen3-14B 40 layers, unquantized contiguous ND BF16, TP=PP=1,
 one Decode sequence, capture sizes `[1]`, no speculative decoding, no
@@ -71,28 +74,65 @@ ASCEND_RT_VISIBLE_DEVICES=<device-id> \
 VLLM_ASCEND_ENABLE_NZ=0 \
 VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH=1 \
 VLLM_ASCEND_PYPTO_LIB_ROOT=/path/to/pypto-lib \
+PTOAS_ROOT=/path/to/pinned-ptoas \
 python tests/e2e/singlecard/qwen3_original_graph_smoke.py \
   --model /path/to/Qwen3-14B
 ```
 
-Use `--eager` for the same original callable through ordinary `worker.run()`,
-with a Torch-stream fence outside capture. This is independent of the new
-graph enqueue path, which has no such host fence inside capture. Compare
-the result records from both runs. The smoke uses three sequential requests,
+The smoke is graph-only; it does not expose a separate `--eager` integration.
+vLLM's required profiling/warmup still uses ordinary `worker.run()` with a
+Torch-stream fence before capture resources are pinned. Captured enqueue has
+no such host fence inside capture. The smoke uses three sequential requests,
 including a repeated prompt, and four generated tokens per request. Stable
 token IDs are a smoke check, not a full numerical or performance benchmark.
 The smoke also records top-5 log probabilities, so stable text cannot conceal
 numerical differences.
 
-`test_qwen3_pypto_graph.py` separately tests plain and fused RMSNorm through
-capture plus changed-input replay against native Torch-NPU RMSNorm. Passing
-that test establishes the runtime graph mechanism only, not 40-layer accuracy.
+`tests/ut/patch/test_qwen3_pypto_graph_patch.py` checks Decode routing, native
+Prefill preservation, path resolution, preparation, launch selection, and
+ordered teardown. Operator-specific RMSNorm graph tests were removed with
+their adapters; they are not current 40-layer acceptance tests.
 
 Shutdown drains the device, resets captured graphs, finalizes the graph token,
 then finalizes the worker. Pinned weights, metadata, cache, and arena storage
 must not be freed while a graph can still replay.
 
-## Validation record: 2026-09-30
+## Graph-only cleanup: 2026-10-09
+
+The active adapter consists of `qwen3_graph.py`, `qwen3_graph_config.py`, and
+`patch_qwen3_pypto_graph.py`, plus the worker import, environment definitions,
+and device sequence-length metadata field. Ten old adapter/runtime files,
+four operator patches, six operator-specific tests, two old design guides,
+eight `_vllm.py` library kernels, and ten matching golden tests are removed.
+Generic Simpler graph APIs and standalone PyPTO-Lib model implementations are
+retained.
+
+This is structural cleanup, not a precision repair or performance change.
+The user-requested precision rollback remains in effect: original split-K
+AtomicAdd, FP32 carry, 32 MiB heap, model-level hook, and compilation mode 0
+are preserved. Historical validation below describes earlier source snapshots,
+not fresh acceptance of this cleanup.
+
+Cleanup verification used Python 3.11.14, CANN 8.5.1, one physical a2a3 NPU,
+and the existing PTOAS 0.60 bundle matching this PyPTO checkout's pin. The stale
+Simpler extension was rebuilt in place from the pinned runtime checkout,
+using `CMAKE_BUILD_PARALLEL_LEVEL=2` and the `build_package_a2a3` build target.
+No CANN or global PTOAS installation was changed.
+
+- Adapter/environment tests: 23 passed, plus 48 environment subtests.
+- Simpler ChipWorker tests: 34 passed, including its graph API contracts.
+- Ruff checks, formatting, compileall, and whitespace checks passed.
+- Active Python sources have no references to removed adapters or flags.
+- Original Decode, PyPTO attention, and Prefill source hashes are unchanged.
+- Fresh full-model graph smoke: three requests, four tokens per request,
+  repeated-prompt token IDs matched, actual `Replaying aclgraph` was logged,
+  and the engine shut down normally.
+
+This is bounded functionality validation, not an HTTP performance benchmark
+or a native-vLLM numerical comparison. Repeated-prompt log probabilities still
+differ after the user-requested precision rollback; cleanup does not repair them.
+
+## Historical validation record: 2026-09-30
 
 This validation used an a2a3 development container with one physical NPU.
 It is offline vLLM engine execution, not an HTTP-serving benchmark.
@@ -176,7 +216,6 @@ CMAKE_BUILD_PARALLEL_LEVEL=2 \
 VLLM_ASCEND_ENABLE_NZ=0 \
 VLLM_BATCH_INVARIANT=1 \
 VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH=1 \
-VLLM_ASCEND_PYPTO_QWEN3_DEBUG=0 \
 VLLM_ASCEND_PYPTO_LIB_ROOT=/path/to/pypto-lib \
 VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT=/path/to/build/vllm_original_graph \
 vllm serve /path/to/Qwen3-14B \

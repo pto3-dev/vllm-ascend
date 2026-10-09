@@ -56,34 +56,4 @@ import vllm_ascend.patch.worker.patch_deepencoder2  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_c8  # noqa
 
 if envs.VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH:
-    if any(
-        mode != "off"
-        for mode in (
-            envs.VLLM_ASCEND_PYPTO_QWEN3_MLP_MODE,
-            envs.VLLM_ASCEND_PYPTO_QWEN3_RMS_MODE,
-            envs.VLLM_ASCEND_PYPTO_QWEN3_QKV_MODE,
-            envs.VLLM_ASCEND_PYPTO_QWEN3_QK_ROPE_MODE,
-            envs.VLLM_ASCEND_PYPTO_QWEN3_ROPE_MODE,
-            envs.VLLM_ASCEND_PYPTO_QWEN3_PA_MODE,
-            envs.VLLM_ASCEND_PYPTO_QWEN3_FUSED_PA_MODE,
-        )
-    ):
-        raise ValueError("Original 40-layer graph cannot be combined with per-layer PyPTO modes")
     import vllm_ascend.patch.worker.patch_qwen3_pypto_graph  # noqa
-
-if envs.VLLM_ASCEND_PYPTO_QWEN3_MLP_MODE != "off" or envs.VLLM_ASCEND_PYPTO_QWEN3_RMS_MODE != "off":
-    import vllm_ascend.patch.worker.patch_qwen3_pypto_mlp  # noqa
-
-if any(
-    mode != "off"
-    for mode in (
-        envs.VLLM_ASCEND_PYPTO_QWEN3_QKV_MODE,
-        envs.VLLM_ASCEND_PYPTO_QWEN3_QK_ROPE_MODE,
-        envs.VLLM_ASCEND_PYPTO_QWEN3_ROPE_MODE,
-        envs.VLLM_ASCEND_PYPTO_QWEN3_FUSED_PA_MODE,
-    )
-):
-    import vllm_ascend.patch.worker.patch_qwen3_pypto_qkv  # noqa
-
-if envs.VLLM_ASCEND_PYPTO_QWEN3_PA_MODE != "off":
-    import vllm_ascend.patch.worker.patch_qwen3_pypto_attention  # noqa

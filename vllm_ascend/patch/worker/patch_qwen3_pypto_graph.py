@@ -17,13 +17,18 @@ _ATTENTION_UPDATE = AscendAttentionBackendImpl.update_graph_params
 
 
 def _metadata(context=None):
-    metadata = (context or get_forward_context()).attn_metadata
+    context = get_forward_context() if context is None else context
+    metadata = context.attn_metadata
     if not isinstance(metadata, dict) or not metadata:
         return None
     value = next(iter(metadata.values()))
     if isinstance(value, list):
         raise ValueError("Original PyPTO graph does not support microbatch metadata")
     return value
+
+
+def _is_single_decode(metadata) -> bool:
+    return metadata is not None and metadata.num_decode_tokens == metadata.num_actual_tokens == 1
 
 
 def _model_forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
@@ -37,13 +42,13 @@ def _model_forward(self, input_ids, positions, intermediate_tensors=None, inputs
     elif _BRIDGE.model is not self:
         raise RuntimeError("One original PyPTO graph model is supported per worker")
     metadata = _metadata()
-    if metadata is not None and metadata.num_decode_tokens == metadata.num_actual_tokens == 1:
+    if _is_single_decode(metadata):
         hidden = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
         return _BRIDGE.decode(hidden, metadata)
     return _MODEL_FORWARD(self, input_ids, positions, intermediate_tensors, inputs_embeds)
 
 
-def torch_npu_capturing():
+def torch_npu_capturing() -> bool:
     import torch
 
     return torch.npu.is_current_stream_capturing()
@@ -54,7 +59,7 @@ def _graph_call(self, *args, **kwargs):
     owns_decode = context.cudagraph_runtime_mode == self.runtime_mode == CUDAGraphMode.FULL
     if owns_decode:
         metadata = _metadata()
-        if metadata is None or metadata.num_actual_tokens != 1:
+        if not _is_single_decode(metadata):
             raise ValueError("Original PyPTO graph requires FULL_DECODE_ONLY and capture sizes [1]")
         if _BRIDGE is None:
             raise RuntimeError("Original PyPTO bridge was not initialized before graph capture")
@@ -72,8 +77,8 @@ def _attention_update(update_stream, forward_context, num_tokens, *args, **kwarg
     if (
         _BRIDGE is not None
         and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-        and metadata is not None
-        and metadata.num_decode_tokens == metadata.num_actual_tokens == num_tokens == 1
+        and _is_single_decode(metadata)
+        and num_tokens == 1
     ):
         # No native Attention task groups were captured for this Decode graph.
         # Its metadata is read by captured copies into PyPTO's fixed buffers.

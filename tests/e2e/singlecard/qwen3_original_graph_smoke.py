@@ -8,10 +8,9 @@ import json
 from vllm import LLM, SamplingParams
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
-    parser.add_argument("--eager", action="store_true")
     args = parser.parse_args()
     llm = LLM(
         model=args.model,
@@ -23,7 +22,7 @@ def main():
         gpu_memory_utilization=0.97,
         num_gpu_blocks_override=4,
         enable_prefix_caching=False,
-        enforce_eager=args.eager,
+        enforce_eager=False,
         compilation_config={"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [1]},
     )
     sampling = SamplingParams(temperature=0, max_tokens=4, ignore_eos=True, logprobs=5)

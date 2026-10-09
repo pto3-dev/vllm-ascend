@@ -14,17 +14,32 @@ import importlib.util
 import logging
 import sys
 import weakref
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_ascend.pypto.qwen3_runtime import get_pypto_paths
+from vllm_ascend.pypto.qwen3_graph_config import get_graph_paths
+
+if TYPE_CHECKING:
+    from pypto.ir.compiled_program import CompiledProgram
+    from simpler.task_interface import ChipTensor
+    from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer, Qwen3Model
+
+    from vllm_ascend.attention.attention_v1 import AscendMetadata
 
 LOG = logging.getLogger(__name__)
 LAYERS, HIDDEN, INTERMEDIATE, KV_HIDDEN, HEAD_DIM, BATCH_PAD = 40, 5120, 17408, 1024, 128, 16
+KV_BLOCK_SIZE, KV_HEADS = 128, 8
+PLATFORM = "a2a3"
+RUNTIME_NAME = "tensormap_and_ringbuffer"
+RING_TASK_WINDOW = 1024
+RING_HEAP_BYTES = 32 * 1024 * 1024
+RING_DEP_POOL = 32768
 
 
-def compile_original_decode40(root: str, build_dir: str, device_id: int):
+def compile_original_decode40(root: str, build_dir: str, device_id: int) -> CompiledProgram:
     """Compile the original body, without allocating dummy model weights."""
     from pypto.runtime import ExecutionMode, RunConfig
 
@@ -52,8 +67,8 @@ def compile_original_decode40(root: str, build_dir: str, device_id: int):
         (1,),
         (128, HEAD_DIM),
         (128, HEAD_DIM),
-        (LAYERS * 128 * 8, HEAD_DIM),
-        (LAYERS * 128 * 8, HEAD_DIM),
+        (LAYERS * KV_BLOCK_SIZE * KV_HEADS, HEAD_DIM),
+        (LAYERS * KV_BLOCK_SIZE * KV_HEADS, HEAD_DIM),
         (LAYERS * HIDDEN, HIDDEN),
         (LAYERS * HIDDEN, INTERMEDIATE),
         (LAYERS * HIDDEN, INTERMEDIATE),
@@ -73,7 +88,7 @@ def compile_original_decode40(root: str, build_dir: str, device_id: int):
         *samples,
         config=RunConfig(
             execution_mode=ExecutionMode.ONBOARD,
-            platform="a2a3",
+            platform=PLATFORM,
             device_id=device_id,
             save_kernels=True,
             save_kernels_dir=build_dir,
@@ -89,7 +104,7 @@ class Qwen3OriginalGraphBridge:
     functional prototype, not a fair Prefill performance comparison.
     """
 
-    def __init__(self, model) -> None:
+    def __init__(self, model: Qwen3Model) -> None:
         from simpler.task_interface import CallConfig, ChipWorker
         from simpler_setup.runtime_builder import RuntimeBuilder
 
@@ -97,6 +112,7 @@ class Qwen3OriginalGraphBridge:
         self.device_id = torch.npu.current_device()
         self.device = torch.device(f"npu:{self.device_id}")
         self.token = None
+        self.arguments = None
         self.graphs: list[weakref.ReferenceType] = []
         self.closed = False
         config = model.config
@@ -115,7 +131,7 @@ class Qwen3OriginalGraphBridge:
         if len(model.layers) != LAYERS or model.quant_config is not None:
             raise ValueError("Original PyPTO Decode requires TP=PP=1 and unquantized BF16")
         self._validate_weights()
-        root, build_dir = get_pypto_paths("original_decode40_graph")
+        root, build_dir = get_graph_paths()
         compiled = compile_original_decode40(root, build_dir, self.device_id)
         LOG.info("Compiled original PyPTO 40-layer Decode callable")
         self._pack_weights()
@@ -130,13 +146,13 @@ class Qwen3OriginalGraphBridge:
         self.worker = ChipWorker()
         self.worker.init(
             device_id=self.device_id,
-            bins=RuntimeBuilder(platform="a2a3").get_binaries("tensormap_and_ringbuffer", build=False),
+            bins=RuntimeBuilder(platform=PLATFORM).get_binaries(RUNTIME_NAME, build=False),
         )
         self.handle = self.worker.register_callable(compiled.chip_callable)
         self.call_config = CallConfig()
-        self.call_config.runtime_env.ring_task_window = 1024
-        self.call_config.runtime_env.ring_heap = 32 * 1024 * 1024
-        self.call_config.runtime_env.ring_dep_pool = 32768
+        self.call_config.runtime_env.ring_task_window = RING_TASK_WINDOW
+        self.call_config.runtime_env.ring_heap = RING_HEAP_BYTES
+        self.call_config.runtime_env.ring_dep_pool = RING_DEP_POOL
         atexit.register(self.close)
 
     def _validate_weights(self) -> None:
@@ -150,12 +166,29 @@ class Qwen3OriginalGraphBridge:
                 if tuple(tensor.shape) != shape or tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
                     raise ValueError("Original Decode requires contiguous ND BF16, TP=1 weights")
 
+    @staticmethod
+    def _projection_modules(layer: Qwen3DecoderLayer) -> tuple[torch.nn.Module, ...]:
+        return layer.self_attn.qkv_proj, layer.self_attn.o_proj, layer.mlp.gate_up_proj, layer.mlp.down_proj
+
+    def _stage_native_projection(self, module: torch.nn.Module, weight: torch.Tensor) -> None:
+        """Retain native Prefill behavior with one temporary projection weight."""
+        original = module.forward
+
+        def native_projection(*args, **kwargs):
+            try:
+                module.weight.data = weight.to(self.device)
+                return original(*args, **kwargs)
+            finally:
+                module.weight.data = weight
+
+        module.forward = native_projection
+
     def _pack_weights(self) -> None:
         # Preserve the native parameters on CPU before freeing their NPU storage.
         # Prefill's original layer forward remains in use, with temporary copies.
         self.host_weights = []
         for layer in self.model.layers:
-            modules = (layer.self_attn.qkv_proj, layer.self_attn.o_proj, layer.mlp.gate_up_proj, layer.mlp.down_proj)
+            modules = self._projection_modules(layer)
             weights = tuple(module.weight.detach().cpu() for module in modules)
             for module, weight in zip(modules, weights):
                 module.weight.data = weight
@@ -163,8 +196,8 @@ class Qwen3OriginalGraphBridge:
         torch.npu.synchronize(self.device_id)
         torch.npu.empty_cache()
 
-        def bank(fn):
-            cpu = torch.cat([fn(weights).contiguous() for weights in self.host_weights], dim=0)
+        def bank(select: Callable[[tuple[torch.Tensor, ...]], torch.Tensor]) -> torch.Tensor:
+            cpu = torch.cat([select(weights).contiguous() for weights in self.host_weights], dim=0)
             return cpu.to(self.device).contiguous()
 
         self.wq = bank(lambda w: w[0][:HIDDEN].t())
@@ -179,21 +212,11 @@ class Qwen3OriginalGraphBridge:
         self.k_norm = torch.stack([layer.self_attn.k_norm.weight.float() for layer in self.model.layers])
         self.post_norm = torch.stack([layer.post_attention_layernorm.weight.float() for layer in self.model.layers])
         for layer, weights in zip(self.model.layers, self.host_weights):
-            modules = (layer.self_attn.qkv_proj, layer.self_attn.o_proj, layer.mlp.gate_up_proj, layer.mlp.down_proj)
-            for module, weight in zip(modules, weights):
-                original = module.forward
-
-                def native_projection(*args, _forward=original, _module=module, _weight=weight, **kwargs):
-                    try:
-                        _module.weight.data = _weight.to(self.device)
-                        return _forward(*args, **kwargs)
-                    finally:
-                        _module.weight.data = _weight
-
-                module.forward = native_projection
+            for module, weight in zip(self._projection_modules(layer), weights):
+                self._stage_native_projection(module, weight)
 
     @staticmethod
-    def chip_tensor(tensor):
+    def chip_tensor(tensor: torch.Tensor) -> ChipTensor:
         from simpler.task_interface import ChipTensor, DataType
 
         mapping = {torch.bfloat16: DataType.BFLOAT16, torch.float32: DataType.FLOAT32, torch.int32: DataType.INT32}
@@ -201,17 +224,17 @@ class Qwen3OriginalGraphBridge:
             raise ValueError("Graph arguments must be contiguous device-owned tensors")
         return ChipTensor.make(tensor.data_ptr(), tuple(tensor.shape), mapping[tensor.dtype], child_memory=True)
 
-    def prepare(self, metadata) -> None:
+    def prepare(self, metadata: AscendMetadata) -> None:
         """Allocate fixed argument storage before eager execution or capture."""
         from simpler.task_interface import ChipStorageTaskArgs
 
-        if hasattr(self, "arguments"):
+        if self.arguments is not None:
             return
         self.caches = [layer.self_attn.attn.kv_cache[0] for layer in self.model.layers]
         if any(not isinstance(cache, (tuple, list)) or len(cache) != 2 for cache in self.caches):
             raise ValueError("Expected separate native K/V cache tensors")
         shape = self.caches[0][0].shape
-        if len(shape) != 4 or tuple(shape[1:]) != (128, 8, HEAD_DIM):
+        if len(shape) != 4 or tuple(shape[1:]) != (KV_BLOCK_SIZE, KV_HEADS, HEAD_DIM):
             raise ValueError(f"Expected native BSND KV cache, got {tuple(shape)}")
         if any(k.shape != shape or v.shape != shape for k, v in self.caches):
             raise ValueError("All 40 native KV pools must have the same shape")
@@ -248,11 +271,12 @@ class Qwen3OriginalGraphBridge:
             self.post_norm,
             self.output,
         )
-        self.arguments = ChipStorageTaskArgs()
+        arguments = ChipStorageTaskArgs()
         for tensor in tensors:
-            self.arguments.add_tensor(self.chip_tensor(tensor))
+            arguments.add_tensor(self.chip_tensor(tensor))
+        self.arguments = arguments
 
-    def prepare_graph(self, metadata) -> None:
+    def prepare_graph(self, metadata: AscendMetadata) -> None:
         """Pin launch resources outside capture, after ordinary eager warmup."""
         if self.token is not None:
             return
@@ -260,10 +284,10 @@ class Qwen3OriginalGraphBridge:
         self.token = self.worker.prepare_graph_run(self.handle, self.arguments, self.call_config)
         LOG.info("Prepared fixed-address PyPTO 40-layer graph resources")
 
-    def decode(self, hidden_states, metadata):
+    def decode(self, hidden_states: torch.Tensor, metadata: AscendMetadata) -> torch.Tensor:
         if hidden_states.shape != (1, HIDDEN):
             raise ValueError("Initial original Decode graph supports one sequence only")
-        if not hasattr(self, "arguments"):
+        if self.arguments is None:
             if torch.npu.is_current_stream_capturing():
                 raise RuntimeError("Original Decode graph was not prepared before capture")
             self.prepare(metadata)
@@ -282,8 +306,8 @@ class Qwen3OriginalGraphBridge:
         if self.token is not None:
             self.worker.enqueue_graph_run(self.token, stream.npu_stream)
         else:
-            # Ordinary eager execution is an independent control for the graph
-            # launch API. Simpler's private streams must observe Torch's copies.
+            # vLLM profiles and warms up before preparing capture resources.
+            # Simpler's private streams must observe Torch's argument copies.
             if torch.npu.is_current_stream_capturing():
                 raise RuntimeError("Ordinary worker.run() cannot execute inside capture")
             stream.synchronize()
@@ -293,7 +317,7 @@ class Qwen3OriginalGraphBridge:
             value.copy_(self.value[i])
         return self.model.norm(self.output[:1])
 
-    def track_graph(self, graph) -> None:
+    def track_graph(self, graph: torch.npu.NPUGraph) -> None:
         if not any(ref() is graph for ref in self.graphs):
             self.graphs.append(weakref.ref(graph))
 
