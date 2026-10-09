@@ -6,6 +6,7 @@ from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.qwen3 import Qwen3Model
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.pypto.qwen3_graph import Qwen3OriginalGraphBridge
@@ -45,6 +46,10 @@ def _model_forward(self, input_ids, positions, intermediate_tensors=None, inputs
     if _is_single_decode(metadata):
         hidden = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
         return _BRIDGE.decode(hidden, metadata)
+    # Any native forward (prefill) writes vLLM's per-layer KV pools: mark the
+    # bridge's stacked pool stale so the next decode re-syncs it once.
+    if _BRIDGE is not None and envs.VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC:
+        _BRIDGE._kv_dirty = True
     return _MODEL_FORWARD(self, input_ids, positions, intermediate_tensors, inputs_embeds)
 
 
@@ -57,6 +62,20 @@ def torch_npu_capturing() -> bool:
 def _graph_call(self, *args, **kwargs):
     context = get_forward_context()
     owns_decode = context.cudagraph_runtime_mode == self.runtime_mode == CUDAGraphMode.FULL
+    if _BRIDGE is not None and envs.VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC:
+        # Lazy KV sync: this Python hook runs for EVERY wrapper call (replays
+        # included — the captured runnable's Python does not), so it is the
+        # right place to mirror the native pools into the stacked pool ONCE
+        # per prefill, eagerly on the current stream, OUTSIDE the captured
+        # graph (never recorded). Covers replays, captures, and any eager
+        # fallback step alike.
+        if (
+            getattr(_BRIDGE, "arguments", None) is not None  # prepare() has allocated the pools
+            and _BRIDGE._kv_dirty
+            and not torch_npu_capturing()
+        ):
+            _BRIDGE.sync_kv_in()
+            _BRIDGE._kv_dirty = False
     if owns_decode:
         metadata = _metadata()
         if not _is_single_decode(metadata):

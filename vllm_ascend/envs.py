@@ -39,6 +39,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH": lambda: bool(
         int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH", "0"))
     ),
+    # Lazy KV sync for the original 40-layer graph bridge: skip the per-step
+    # 80-copy KV mirror inside the decode graph; mirror vLLM's native per-layer
+    # pools into the kernel's stacked pool once per prefill instead (eagerly,
+    # outside the captured graph). The kernel's in-place KV writes then remain
+    # authoritative for the rest of that decode run. Valid for the bridge's
+    # supported domain: single decode sequence, prefix caching off, no KV
+    # connectors. 0 (default) keeps the per-step mirror; 1 enables lazy sync.
+    "VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC", "0"))
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
