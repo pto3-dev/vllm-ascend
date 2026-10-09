@@ -17,6 +17,8 @@
 
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend import envs
+
 if HAS_TRITON:
     import vllm_ascend.patch.worker.patch_triton
     import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
@@ -52,3 +54,6 @@ import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
 import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
 import vllm_ascend.patch.worker.patch_deepencoder2  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_c8  # noqa
+
+if envs.VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH:
+    import vllm_ascend.patch.worker.patch_qwen3_pypto_graph  # noqa

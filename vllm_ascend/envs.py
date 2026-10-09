@@ -28,6 +28,17 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # PyPTO-Lib checkout used by the experimental Qwen3-14B Decode bridge.
+    # Defaults to the legacy PYPTO_LIB_ROOT value for compatibility; not sensitive.
+    "VLLM_ASCEND_PYPTO_LIB_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_LIB_ROOT", os.getenv("PYPTO_LIB_ROOT")),
+    # Root directory for the original Qwen3-14B graph callable's artifacts.
+    # Defaults to a temporary directory; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT": lambda: os.getenv("VLLM_ASCEND_PYPTO_QWEN3_BUILD_ROOT"),
+    # Experimental original 40-layer callable inside FULL_DECODE_ONLY graphs.
+    # Default off. Requires TP=PP=1, BF16, capture sizes [1]; not sensitive.
+    "VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH", "0"))
+    ),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

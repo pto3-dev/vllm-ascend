@@ -16,4 +16,5 @@ add_custom_aclnn_op
 context_parallel
 quantization
 npugraph_ex
+../pypto_qwen3_original_graph
 :::
