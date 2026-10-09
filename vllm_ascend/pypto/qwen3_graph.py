@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm_ascend import envs
 from vllm_ascend.pypto.qwen3_graph_config import get_graph_paths
 
 if TYPE_CHECKING:
@@ -246,6 +247,7 @@ class Qwen3OriginalGraphBridge:
             raise ValueError("Original Decode requires contiguous BF16 native KV cache on this NPU")
         self.key = torch.empty((LAYERS, *shape), dtype=torch.bfloat16, device=self.device)
         self.value = torch.empty_like(self.key)
+        self._kv_dirty = True  # stacked pool starts stale; synced once per prefill in lazy mode
         self.table = torch.empty_like(metadata.block_tables[:1].reshape(-1))
         if self.table.dtype != torch.int32:
             raise ValueError("Native block tables must be INT32")
@@ -284,6 +286,18 @@ class Qwen3OriginalGraphBridge:
         self.token = self.worker.prepare_graph_run(self.handle, self.arguments, self.call_config)
         LOG.info("Prepared fixed-address PyPTO 40-layer graph resources")
 
+    def sync_kv_in(self) -> None:
+        """Mirror vLLM's native per-layer KV pools into the stacked pool."""
+        for i, (key, value) in enumerate(self.caches):
+            self.key[i].copy_(key)
+            self.value[i].copy_(value)
+
+    def _sync_kv_out(self) -> None:
+        """Mirror the stacked pool back into vLLM's native per-layer pools."""
+        for i, (key, value) in enumerate(self.caches):
+            key.copy_(self.key[i])
+            value.copy_(self.value[i])
+
     def decode(self, hidden_states: torch.Tensor, metadata: AscendMetadata) -> torch.Tensor:
         if hidden_states.shape != (1, HIDDEN):
             raise ValueError("Initial original Decode graph supports one sequence only")
@@ -299,22 +313,31 @@ class Qwen3OriginalGraphBridge:
         self.seq.copy_(seq_lens[:1])
         self.table.copy_(metadata.block_tables[:1].reshape(-1))
         self.slot.copy_(metadata.slot_mapping[:1])
-        for i, (key, value) in enumerate(self.caches):
-            self.key[i].copy_(key)
-            self.value[i].copy_(value)
+        mirror = not envs.VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC
+        if mirror:
+            self.sync_kv_in()
         stream = torch.npu.current_stream(self.device_id)
         if self.token is not None:
+            # Lazy mode deliberately captures NO KV mirror into the graph:
+            # sync_kv_in() runs once per prefill from the graph-wrapper patch,
+            # outside capture, and the kernel's in-place KV writes stay
+            # authoritative for the rest of that decode run.
+            if (not mirror) and self._kv_dirty and not torch.npu.is_current_stream_capturing():
+                self.sync_kv_in()
+                self._kv_dirty = False
             self.worker.enqueue_graph_run(self.token, stream.npu_stream)
         else:
             # vLLM profiles and warms up before preparing capture resources.
             # Simpler's private streams must observe Torch's argument copies.
             if torch.npu.is_current_stream_capturing():
                 raise RuntimeError("Ordinary worker.run() cannot execute inside capture")
+            if (not mirror) and self._kv_dirty:
+                self.sync_kv_in()
+                self._kv_dirty = False
             stream.synchronize()
             self.worker.run(self.handle, self.arguments, self.call_config)
-        for i, (key, value) in enumerate(self.caches):
-            key.copy_(self.key[i])
-            value.copy_(self.value[i])
+        if mirror:
+            self._sync_kv_out()
         return self.model.norm(self.output[:1])
 
     def track_graph(self, graph: torch.npu.NPUGraph) -> None:

@@ -254,3 +254,56 @@ stages projection weights from CPU, and the Decode bridge copies the complete
 prototype's CPU-to-NPU transfers. All three output text hashes matched, but
 this does not close the numerical-parity issue above. No native-vLLM speedup
 or production-readiness claim follows from this measurement.
+
+## Lazy KV sync: 2026-10-09
+
+An opt-in mode removes the per-step KV mirror from the captured Decode graph
+and re-syncs the stacked pool only when native forwards have written it —
+once per prefill. It changes no kernel, capture, or KV-cache management;
+only the timing of the mirror copies.
+
+`VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC=1` (default 0) gates the mode. The
+mechanism is a dirty flag driven from the two Python hooks that run for every
+graph-wrapper call (replays included; the captured runnable's Python does not
+run during replay):
+
+- The `Qwen3Model.forward` patch marks `_kv_dirty` on any native (non
+  single-decode) forward, i.e. every prefill.
+- The `ACLGraphWrapper.__call__` patch mirrors the native per-layer pools
+  into the stacked pool eagerly on the current stream — outside capture,
+  never recorded — before the next decode step, and clears the flag.
+
+The kernel's in-place KV writes (cache append at `slot_mapping`) then stay
+authoritative for the rest of that decode run; the write-back direction is
+dropped for decode steps entirely.
+
+```text
+default:  replay = [metadata copies] [80x KV mirror in] [kernel] [80x KV mirror out] [norm]
+lazy:     replay = [metadata copies] [kernel] [norm]     ← no KV copies captured
+          prefill → next replay: one eager sync (~1.1 ms, ~0.74 GB), outside the graph
+```
+
+Correctness domain: identical to the bridge itself, plus one condition — the
+stacked pool is re-synced only at prefill boundaries, which is exactly
+correct while nothing else writes the native pools inside a decode run
+(single sequence, prefix caching disabled, no KV connectors). Prefix-cache
+block reuse or KV migration would need page-level dirty tracking.
+
+Validation used the post-cleanup sources, the same container, one a2a3 NPU,
+and the same benchmark method as the 2026-09-30 HTTP record above (two
+warmups, three measured 300/128 requests, client-observed streaming TPOT):
+
+| Mode | TPOT (median) | E2EL (median) | Output hash |
+| --- | ---: | ---: | --- |
+| Per-step mirror (default, 2026-09-30 record above) | 45.25 ms | 7.262 s | `7371ebd8…` |
+| Lazy sync (this run) | **42.36 ms** | 6.92 s | `7371ebd8…` |
+
+−2.90 ms/token; all three output text hashes match the default mode's
+recorded hash, and the offline smoke passes with lazy sync enabled,
+including the repeated-prompt assertion, which exercises the dirty-flag
+re-sync path (prefill → sync → replay). The default path is unchanged:
+`VLLM_ASCEND_PYPTO_QWEN3_LAZY_KV_SYNC=0` (or unset) reproduces the
+per-step-mirror behavior.
+
+This remains within the same experimental claims as the bridge: no
+full-model numerical acceptance, no production-readiness claim.
