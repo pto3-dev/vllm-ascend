@@ -277,7 +277,12 @@ class NPUModelRunner(GPUModelRunner):
         self.use_hybrid_blocks: bool = False
         self.need_accepted_tokens: bool = False
 
-        self.is_multimodal_model = self.model_config.is_multimodal_model
+        # Text-only capture must use the same token-ID input path as real
+        # requests. MM dummy embeddings would otherwise be frozen in the graph.
+        self.is_multimodal_model = self.model_config.is_multimodal_model and not (
+            self.model_config.multimodal_config is not None
+            and self.model_config.multimodal_config.language_model_only
+        )
         self.block_size = vllm_config.cache_config.block_size
         # Set up Attention
         self.use_sparse = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
@@ -475,7 +480,10 @@ class NPUModelRunner(GPUModelRunner):
     def _use_aclgraph(self) -> bool:
         return (
             self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+            and (
+                self.compilation_config.mode == CompilationMode.VLLM_COMPILE
+                or self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            )
             and not self.model_config.enforce_eager
         )
 
