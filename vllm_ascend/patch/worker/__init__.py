@@ -57,3 +57,5 @@ import vllm_ascend.patch.worker.patch_qwen3_c8  # noqa
 
 if envs.VLLM_ASCEND_PYPTO_QWEN3_ORIGINAL_GRAPH:
     import vllm_ascend.patch.worker.patch_qwen3_pypto_graph  # noqa
+
+import vllm_ascend.patch.worker.patch_qwen3_8_mpmd  # noqa: F401
