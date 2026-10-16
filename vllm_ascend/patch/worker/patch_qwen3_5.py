@@ -206,7 +206,12 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
-        if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None:
+        # The combined sigmoid/recurrent Triton kernel faults for the dense
+        # 27B FP32 state on 910B. Its existing split native path is validated.
+        split_dense_27b = (
+            self.hidden_size == 5120 and self.num_k_heads == 16 and self.num_v_heads == 48 and self.head_k_dim == 128
+        )
+        if attn_metadata.num_prefills > 0 or spec_sequence_masks is not None or split_dense_27b:
             g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
             if spec_sequence_masks is not None:
                 if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -325,7 +330,9 @@ class AscendQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, output: torch.Tensor, hidden_states: torch.Tensor):
         qkv, _ = self.qkv_proj(hidden_states)
-        if "qwen3_5" in self.config.model_type:
+        # The fused Triton tile exceeds UB bounds for the dense 27B shape
+        # (24 Q heads, dimension 256). Keep its existing native split path.
+        if "qwen3_5" in self.config.model_type and not (self.num_heads == 24 and self.head_dim == 256):
             cos_sin = self.rotary_emb.cos_sin_cache[positions]
             if cos_sin.device != qkv.device:
                 cos_sin = cos_sin.to(qkv.device)
