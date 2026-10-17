@@ -190,7 +190,12 @@ def main():
             local = dict(borrowed)
             for name, shape, dtype, _ in specs[0].arguments:
                 if name not in local:
-                    local[name] = allocate(runtime, shape, DTYPES[dtype])
+                    if name == "device_program_storage":
+                        from models.qwen3_8_27b.attention_program_adapter import allocate_program_storage
+
+                        local[name] = allocate_program_storage(runtime, generation / "tokens1/build")
+                    else:
+                        local[name] = allocate(runtime, shape, DTYPES[dtype])
             tensors = [local[name] for name, _, _, _ in specs[0].arguments]
             report["promoted_ordinals"] = promote_graph_ordinals(runtime)
             # This ordinary request validates every argument and establishes
