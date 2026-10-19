@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
-from pypto import ir
+from pypto import backend, ir
 from pypto.ir import DistributedConfig
 from pypto.ir.distributed_compiled_program import DistributedCompiledProgram
 
@@ -25,7 +25,7 @@ allocate = _model_runtime.allocate
 orchestration_optimization = _model_runtime.orchestration_optimization
 
 NZ = ("5120x17408", "5120x5120", "5120x3072", "5120x6144", "5120x512", "3072x5120", "5120x124160")
-DTYPES = dict(BF16=torch.bfloat16, FP32=torch.float32, INT32=torch.int32, INT64=torch.int64)
+DTYPES = dict(BF16=torch.bfloat16, FP32=torch.float32, INT32=torch.int32, INT64=torch.int64, UINT8=torch.uint8)
 
 
 def compile_programs(
@@ -45,9 +45,14 @@ def compile_programs(
 ):
     if phase_nz or nz_tile_policy:
         raise ValueError("This integration supports shared ND weights only.")
+    backend.set_backend_type(backend.BackendType.Ascend910B)
+    if projection_tile_policy is None:
+        policy_path = ensure_model_root() / "models/qwen3_8_27b/projection_tiles.json"
+        projection_tile_policy = json.loads(policy_path.read_text())
     digest = hashlib.sha256()
-    for path in sorted(Path(__import__("models.qwen3_8_27b", fromlist=[""]).__file__).parent.glob("*.py")):
-        digest.update(path.name.encode() + path.read_bytes())
+    for path in sorted(Path(__import__("models.qwen3_8_27b", fromlist=[""]).__file__).parent.glob("*")):
+        if path.is_file() and path.suffix in (".py", ".h", ".json"):
+            digest.update(path.name.encode() + path.read_bytes())
     digest.update(json.dumps(dimensions, sort_keys=True).encode())
     digest.update(Path(__file__).with_name("cache_packet_adapter.py").read_bytes())
     digest.update(b"native-prefill-shared-ND-decode-v1")
@@ -116,13 +121,19 @@ def compile_programs(
         )
         distribution = DistributedConfig(device_ids=[0, 1], num_sub_workers=0)
         with orchestration_optimization("O1"):
-            if (path / "build" / "native_cache_packet.json").exists():
+            if (path / "build" / "attention_program_manifest.json").exists() and (
+                path / "build" / "mlp_input_manifest.json"
+            ).exists():
                 compiled = DistributedCompiledProgram.from_dir(
                     path / "build", platform="a2a3", distributed_config=distribution
                 )
             else:
                 ir.compile(fn, output_dir=str(path / "build"), platform="a2a3", distributed_config=distribution)
                 contract_cache_packet(path / "build", typed_spec, spec)
+                adapters = importlib.import_module("models.qwen3_8_27b.attention_program_adapter")
+                importlib.import_module("models.qwen3_8_27b.fixed_mlp_adapter").install_fixed_mlp(path / "build")
+                adapters.install_attention_program(path / "build")
+                importlib.import_module("models.qwen3_8_27b.mlp_input_adapter").install_mlp_input(path / "build")
                 compiled = DistributedCompiledProgram.from_dir(
                     path / "build", platform="a2a3", distributed_config=distribution
                 )
